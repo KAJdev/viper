@@ -4,6 +4,7 @@ import os
 import shutil
 import sys
 import tempfile
+import tomllib
 from pathlib import Path
 
 
@@ -44,10 +45,10 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def cmd_build(args: argparse.Namespace) -> int:
-    from viper.freezer import scan_package, scan_dependencies, scan_stdlib_subset
+    from viper.freezer import scan_package, scan_all_dependencies, NativePackage
     from viper.embed import generate_frozen_c
-    from viper.linker import compile_c_files, CompilerConfig
-    from viper.dep_scanner import find_all_imports
+    from viper.linker import compile_c_files, CompilerConfig, get_standalone_python_dir, \
+        _detect_python_version, bundle_native_packages
 
     pkg_path = args.path.resolve()
     if not pkg_path.exists():
@@ -76,80 +77,61 @@ def cmd_build(args: argparse.Namespace) -> int:
         print(f"  found {len(scan.modules)} modules")
 
     all_modules = list(scan.modules)
+    native_packages: list[NativePackage] = []
 
-    # for binary mode, we freeze only the main package modules.
-    # third-party deps and stdlib are loaded from the python environment
-    # at runtime via site-packages. this avoids version mismatches and
-    # handles C extensions (pydantic-core, etc) that can't be frozen.
-    #
-    # future: --standalone flag will bundle everything for fully
-    # self-contained distribution.
+    # scan and freeze all transitive dependencies
+    if not args.no_deps:
+        if verbose:
+            print("scanning dependencies...")
+        dep_scan = scan_all_dependencies(pkg_path)
+        all_modules.extend(dep_scan.frozen)
+        native_packages = dep_scan.native
+        if verbose:
+            print(f"  frozen: {len(dep_scan.frozen)} modules")
+            print(f"  native: {len(dep_scan.native)} packages (have C extensions)")
 
     if verbose:
         print(f"total modules to embed: {len(all_modules)}")
 
     # determine output name
+    pkg_name = _detect_package_name(pkg_path)
     if args.output:
         output = args.output.resolve()
     else:
-        # prefer the script name from [project.scripts] for binary output
         script_name = _detect_script_name(pkg_path)
-        if script_name:
-            output = Path.cwd() / script_name
-        else:
-            pkg_name = _detect_package_name(pkg_path)
-            output = Path.cwd() / pkg_name
+        output = Path.cwd() / (script_name or pkg_name)
+
+    # detect standalone mode
+    pbs_dir = get_standalone_python_dir()
+    standalone_bundle = None
+    python_version = None
+    if pbs_dir:
+        standalone_bundle = f"{output.name}.lib"
+        python_version = _detect_python_version(pbs_dir)
 
     # generate and compile
     with tempfile.TemporaryDirectory(prefix="viper_") as tmpdir:
         tmp = Path(tmpdir)
-
-        # generate the C source with embedded bytecode
         c_file = tmp / "viper_embedded.c"
+
+        pkg_version = _detect_package_version(pkg_path)
+
         if verbose:
             print(f"generating C source ({len(all_modules)} modules)...")
 
-        # collect site-packages paths from the current environment
-        import site
-        site_packages = site.getsitepackages()
-        # also include user site and any PYTHONPATH entries
-        user_site = site.getusersitepackages()
-        if isinstance(user_site, str):
-            site_packages.append(user_site)
-        # include paths from sys.path that look like site-packages or source dirs
-        for p in sys.path:
-            if p and p not in site_packages and os.path.isdir(p):
-                site_packages.append(p)
-
-        # detect package name and version for metadata
-        pkg_name = _detect_package_name(pkg_path)
-        pkg_version = _detect_package_version(pkg_path)
-
-        # detect standalone mode (python-build-standalone available)
-        from viper.linker import get_standalone_python_dir, _detect_python_version
-        pbs_dir = get_standalone_python_dir()
-        standalone_bundle = None
-        python_version = None
-        if pbs_dir:
-            script_name = _detect_script_name(pkg_path)
-            bin_name = script_name or pkg_name
-            standalone_bundle = f"{bin_name}.lib"
-            python_version = _detect_python_version(pbs_dir)
-
         generate_frozen_c(
             all_modules, entry_point, c_file,
-            site_packages=site_packages,
             package_name=_detect_dist_name(pkg_path) or pkg_name,
             package_version=pkg_version,
             standalone_bundle=standalone_bundle,
             python_version=python_version,
+            has_native_packages=bool(native_packages),
         )
 
         if verbose:
             c_size = c_file.stat().st_size
             print(f"  generated {c_size:,} bytes of C")
 
-        # compile
         config = CompilerConfig()
         if verbose:
             print(f"compiling with {config.cc}...")
@@ -161,101 +143,75 @@ def cmd_build(args: argparse.Namespace) -> int:
             mode="binary",
         )
 
+    # bundle native packages (C extensions) alongside the binary
+    if native_packages and standalone_bundle:
+        sp_dir = output.parent / standalone_bundle / "site-packages"
+        bundle_native_packages(native_packages, sp_dir, verbose=verbose)
+
     size = output.stat().st_size
     print(f"built: {output} ({size:,} bytes)")
     return 0
 
 
-def _detect_entry_point(pkg_path: Path) -> str | None:
-    """try to detect the entry point from pyproject.toml."""
+def _load_pyproject(pkg_path: Path) -> dict | None:
+    """load and parse pyproject.toml from a package directory."""
     pyproject = pkg_path / "pyproject.toml"
     if not pyproject.exists():
-        # single file mode
+        return None
+    with open(pyproject, "rb") as f:
+        return tomllib.load(f)
+
+
+def _detect_entry_point(pkg_path: Path) -> str | None:
+    """try to detect the entry point from pyproject.toml."""
+    data = _load_pyproject(pkg_path)
+    if data is None:
         if pkg_path.is_file() and pkg_path.suffix == ".py":
             return f"{pkg_path.stem}:main"
         return None
 
-    text = pyproject.read_text()
-    # look for [project.scripts]
-    in_scripts = False
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped == "[project.scripts]":
-            in_scripts = True
-            continue
-        if in_scripts:
-            if stripped.startswith("["):
-                break
-            if "=" in stripped:
-                # take the first script entry
-                _, value = stripped.split("=", 1)
-                value = value.strip().strip('"').strip("'")
-                return value
-
+    scripts = data.get("project", {}).get("scripts", {})
+    if scripts:
+        return next(iter(scripts.values()))
     return None
 
 
 def _detect_package_name(pkg_path: Path) -> str:
-    """derive a binary name from the package."""
-    pyproject = pkg_path / "pyproject.toml"
-    if pyproject.exists():
-        text = pyproject.read_text()
-        for line in text.splitlines():
-            if line.strip().startswith("name"):
-                _, value = line.split("=", 1)
-                name = value.strip().strip('"').strip("'")
-                return name.replace("-", "_")
+    """derive a package name from pyproject.toml."""
+    data = _load_pyproject(pkg_path)
+    if data:
+        name = data.get("project", {}).get("name")
+        if name:
+            return name.replace("-", "_")
 
     if pkg_path.is_file():
         return pkg_path.stem
-
     return pkg_path.name
 
 
 def _detect_dist_name(pkg_path: Path) -> str | None:
     """get the distribution name (with hyphens) from pyproject.toml."""
-    pyproject = pkg_path / "pyproject.toml"
-    if pyproject.exists():
-        text = pyproject.read_text()
-        for line in text.splitlines():
-            if line.strip().startswith("name"):
-                _, value = line.split("=", 1)
-                return value.strip().strip('"').strip("'")
+    data = _load_pyproject(pkg_path)
+    if data:
+        return data.get("project", {}).get("name")
     return None
 
 
 def _detect_script_name(pkg_path: Path) -> str | None:
     """get the CLI script name from [project.scripts] in pyproject.toml."""
-    pyproject = pkg_path / "pyproject.toml"
-    if not pyproject.exists():
-        return None
-    text = pyproject.read_text()
-    in_scripts = False
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped == "[project.scripts]":
-            in_scripts = True
-            continue
-        if in_scripts:
-            if stripped.startswith("["):
-                break
-            if "=" in stripped:
-                name, _ = stripped.split("=", 1)
-                return name.strip()
+    data = _load_pyproject(pkg_path)
+    if data:
+        scripts = data.get("project", {}).get("scripts", {})
+        if scripts:
+            return next(iter(scripts.keys()))
     return None
 
 
 def _detect_package_version(pkg_path: Path) -> str | None:
     """extract the version from pyproject.toml."""
-    pyproject = pkg_path / "pyproject.toml"
-    if not pyproject.exists():
-        return None
-    text = pyproject.read_text()
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("version") and "=" in stripped:
-            _, value = stripped.split("=", 1)
-            return value.strip().strip('"').strip("'")
+    data = _load_pyproject(pkg_path)
+    if data:
+        return data.get("project", {}).get("version")
     return None
 
 

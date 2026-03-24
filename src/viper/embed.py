@@ -7,34 +7,31 @@ def generate_frozen_c(
     modules: list[FrozenModule],
     entry_point: str,
     output: Path,
-    site_packages: list[str] | None = None,
     package_name: str | None = None,
     package_version: str | None = None,
     standalone_bundle: str | None = None,
     python_version: str | None = None,
+    has_native_packages: bool = False,
 ) -> Path:
     """generate a C file that embeds all frozen modules using PyImport_FrozenModules.
 
     uses cpython's native frozen module infrastructure so imports are resolved
     entirely in C with no python-level finder overhead.
 
-    standalone_bundle: if set, the name of the .lib directory next to the binary
-        (e.g. "flash.lib"). the generated C will configure python to find its
-        stdlib from this bundle at runtime.
-    python_version: e.g. "3.14" - required when standalone_bundle is set.
+    standalone_bundle: the name of the .lib directory next to the binary
+        (e.g. "flash.lib"). the generated C configures python to find its
+        stdlib and native packages from this bundle at runtime.
+    has_native_packages: if true, adds the bundle's site-packages dir to
+        sys.path so C extensions can be found.
     """
     lines: list[str] = []
     lines.append('#include <Python.h>')
+    lines.append('#include <limits.h>')
+    lines.append('#include <libgen.h>')
+    lines.append('#ifdef __APPLE__')
+    lines.append('#include <mach-o/dyld.h>')
+    lines.append('#endif')
     lines.append('')
-
-    if standalone_bundle:
-        # need to resolve executable path at runtime
-        lines.append('#include <limits.h>')
-        lines.append('#include <libgen.h>')
-        lines.append('#ifdef __APPLE__')
-        lines.append('#include <mach-o/dyld.h>')
-        lines.append('#endif')
-        lines.append('')
 
     # emit bytecode arrays
     for mod in modules:
@@ -69,8 +66,7 @@ def generate_frozen_c(
         lines.append(f'static const char *viper_startup_code = "{escaped}";')
         lines.append('')
 
-    if standalone_bundle:
-        _emit_exe_dir_helper(lines)
+    _emit_exe_dir_helper(lines)
 
     # emit main
     mod_part, callable_part = _parse_entry_point(entry_point)
@@ -78,6 +74,10 @@ def generate_frozen_c(
     lines.append('int main(int argc, char **argv) {')
     lines.append('    /* register frozen modules before interpreter init */')
     lines.append('    PyImport_FrozenModules = viper_frozen_modules;')
+    lines.append('')
+    lines.append('    /* resolve path to this executable */')
+    lines.append('    char exe_dir[PATH_MAX];')
+    lines.append('    int have_exe_dir = (get_exe_dir(exe_dir, sizeof(exe_dir)) == 0);')
     lines.append('')
     lines.append('    PyStatus status;')
     lines.append('    PyConfig config;')
@@ -93,21 +93,22 @@ def generate_frozen_c(
     if standalone_bundle:
         pyver = python_version or "3.14"
         pyver_nodot = pyver.replace(".", "")
-        _emit_standalone_path_config(lines, standalone_bundle, pyver, pyver_nodot)
+        _emit_standalone_path_config(lines, standalone_bundle, pyver, pyver_nodot,
+                                     has_native_packages)
 
     lines.append('    status = Py_InitializeFromConfig(&config);')
     lines.append('    if (PyStatus_Exception(status)) goto fail;')
     lines.append('    PyConfig_Clear(&config);')
     lines.append('')
 
-    # add site-packages paths (for non-frozen third-party deps)
-    if site_packages:
-        lines.append('    /* add site-packages paths from build environment */')
-        lines.append('    {')
+    # add bundle site-packages to sys.path for C extension loading
+    if has_native_packages and standalone_bundle:
+        lines.append('    /* add bundle site-packages to sys.path for C extensions */')
+        lines.append('    if (have_exe_dir) {')
+        lines.append('        char sp_path[PATH_MAX];')
+        lines.append(f'        snprintf(sp_path, sizeof(sp_path), "%s/{standalone_bundle}/site-packages", exe_dir);')
         lines.append('        PyObject *sys_path = PySys_GetObject("path");')
-        for sp in site_packages:
-            escaped_sp = sp.replace("\\", "\\\\")
-            lines.append(f'        PyList_Insert(sys_path, 0, PyUnicode_FromString("{escaped_sp}"));')
+        lines.append('        PyList_Insert(sys_path, 0, PyUnicode_FromString(sp_path));')
         lines.append('    }')
         lines.append('')
 
@@ -207,20 +208,11 @@ def _emit_standalone_path_config(
     bundle_name: str,
     pyver: str,
     pyver_nodot: str,
+    has_native_packages: bool,
 ) -> None:
-    """emit C code that configures python's module search paths for standalone mode.
-
-    tells cpython to find its stdlib from the bundle directory next to
-    the executable instead of searching for a system python installation.
-    """
+    """emit C code that configures python's module search paths for standalone mode."""
     lines.append('    /* configure standalone python paths */')
-    lines.append('    {')
-    lines.append(f'        char exe_dir[PATH_MAX];')
-    lines.append(f'        if (get_exe_dir(exe_dir, sizeof(exe_dir)) != 0) {{')
-    lines.append(f'            fprintf(stderr, "viper: could not resolve executable path\\n");')
-    lines.append(f'            goto fail;')
-    lines.append(f'        }}')
-    lines.append('')
+    lines.append('    if (have_exe_dir) {')
     lines.append(f'        char home_path[PATH_MAX];')
     lines.append(f'        snprintf(home_path, sizeof(home_path), "%s/{bundle_name}", exe_dir);')
     lines.append('')
@@ -229,9 +221,7 @@ def _emit_standalone_path_config(
     lines.append(f'        status = PyConfig_SetString(&config, &config.home, whome);')
     lines.append(f'        if (PyStatus_Exception(status)) goto fail;')
     lines.append('')
-    lines.append(f'        /* set explicit module search paths */')
     lines.append(f'        config.module_search_paths_set = 1;')
-    lines.append('')
     lines.append(f'        char path_buf[PATH_MAX];')
     lines.append(f'        wchar_t wpath[PATH_MAX];')
     lines.append('')
@@ -241,11 +231,20 @@ def _emit_standalone_path_config(
     lines.append(f'        status = PyWideStringList_Append(&config.module_search_paths, wpath);')
     lines.append(f'        if (PyStatus_Exception(status)) goto fail;')
     lines.append('')
-    # lib-dynload
+    # lib-dynload (stdlib C extensions)
     lines.append(f'        snprintf(path_buf, sizeof(path_buf), "%s/{bundle_name}/python{pyver}/lib-dynload", exe_dir);')
     lines.append(f'        mbstowcs(wpath, path_buf, PATH_MAX);')
     lines.append(f'        status = PyWideStringList_Append(&config.module_search_paths, wpath);')
     lines.append(f'        if (PyStatus_Exception(status)) goto fail;')
+
+    if has_native_packages:
+        lines.append('')
+        # third-party C extensions
+        lines.append(f'        snprintf(path_buf, sizeof(path_buf), "%s/{bundle_name}/site-packages", exe_dir);')
+        lines.append(f'        mbstowcs(wpath, path_buf, PATH_MAX);')
+        lines.append(f'        status = PyWideStringList_Append(&config.module_search_paths, wpath);')
+        lines.append(f'        if (PyStatus_Exception(status)) goto fail;')
+
     lines.append('    }')
     lines.append('')
 
@@ -256,9 +255,8 @@ def _generate_startup_python(
 ) -> str:
     """generate minimal python startup code.
 
-    only sets sys.frozen and injects package metadata for
-    importlib.metadata.version() support. no import machinery here -
-    that's handled entirely by cpython's frozen module infrastructure.
+    sets sys.frozen and injects package metadata for
+    importlib.metadata.version() support.
     """
     parts = ["import sys", "sys.frozen = True"]
 
