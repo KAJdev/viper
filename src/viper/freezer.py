@@ -1,4 +1,6 @@
 from __future__ import annotations
+import base64
+import json
 import marshal
 import importlib
 import tomllib
@@ -7,11 +9,59 @@ import importlib.util
 import os
 import re
 import shutil
+import subprocess
 import sys
 import sysconfig
 from collections import deque
 from pathlib import Path
 from dataclasses import dataclass, field
+
+
+# toolchain python for cross-compiling bytecode. set via set_cross_python()
+# before scanning. when None, uses the host python's compile() directly.
+_cross_python: Path | None = None
+_cross_proc: subprocess.Popen | None = None
+
+# helper script run in the toolchain python. reads file paths from stdin,
+# writes back base64-encoded marshalled bytecode over stdout.
+_COMPILER_SCRIPT = r"""
+import sys, marshal, base64
+for line in sys.stdin:
+    path = line.strip()
+    if not path:
+        continue
+    try:
+        with open(path) as f:
+            source = f.read()
+        code = compile(source, path, "exec", dont_inherit=True, optimize=2)
+        data = base64.b64encode(marshal.dumps(code)).decode()
+        sys.stdout.write(f"OK {data}\n")
+    except Exception as e:
+        sys.stdout.write(f"ERR {e}\n")
+    sys.stdout.flush()
+"""
+
+
+def set_cross_python(python_path: Path | None) -> None:
+    """set the toolchain python used for bytecode compilation."""
+    global _cross_python, _cross_proc
+    _cross_python = python_path
+    if _cross_proc is not None:
+        _cross_proc.terminate()
+        _cross_proc = None
+
+
+def _get_cross_proc() -> subprocess.Popen:
+    """get or start the persistent cross-compiler subprocess."""
+    global _cross_proc
+    if _cross_proc is None or _cross_proc.poll() is not None:
+        _cross_proc = subprocess.Popen(
+            [str(_cross_python), "-c", _COMPILER_SCRIPT],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+    return _cross_proc
 
 
 @dataclass
@@ -174,11 +224,31 @@ def scan_stdlib_subset(used_modules: set[str]) -> list[FrozenModule]:
 
 
 def compile_to_bytecode(source_path: Path) -> bytes:
-    """compile a .py file to marshalled bytecode."""
+    """compile a .py file to marshalled bytecode.
+
+    uses the cross-compiler subprocess when set_cross_python() has been
+    called, otherwise compiles with the host python directly.
+    """
+    if _cross_python is not None:
+        return _cross_compile(source_path)
     with open(source_path, "r") as f:
         source = f.read()
     code = compile(source, str(source_path), "exec", dont_inherit=True, optimize=2)
     return marshal.dumps(code)
+
+
+def _cross_compile(source_path: Path) -> bytes:
+    """compile a single file via the toolchain python subprocess."""
+    proc = _get_cross_proc()
+    proc.stdin.write(f"{source_path}\n")
+    proc.stdin.flush()
+    line = proc.stdout.readline().strip()
+    if line.startswith("OK "):
+        return base64.b64decode(line[3:])
+    elif line.startswith("ERR "):
+        raise SyntaxError(f"cross-compile failed for {source_path}: {line[4:]}")
+    else:
+        raise RuntimeError(f"unexpected cross-compiler response: {line!r}")
 
 
 # --- dependency resolution ---

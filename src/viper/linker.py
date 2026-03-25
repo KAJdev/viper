@@ -31,13 +31,12 @@ def get_runtime_dir() -> Path:
     return Path(__file__).parent.parent.parent / "runtime"
 
 
-def get_standalone_python_dir() -> Path | None:
-    """path to the python-build-standalone install_only distribution."""
-    viper_root = Path(__file__).parent.parent.parent
-    pbs_dir = viper_root / ".python-standalone" / "python"
-    if pbs_dir.exists() and (pbs_dir / "lib").exists():
-        return pbs_dir
-    return None
+def _detect_python_version(tc_dir: Path) -> str:
+    """detect the python major.minor version from a toolchain directory."""
+    for d in (tc_dir / "lib").iterdir():
+        if d.is_dir() and d.name.startswith("python3."):
+            return d.name.replace("python", "")
+    raise RuntimeError(f"could not detect python version in {tc_dir}")
 
 
 def compile_c_files(
@@ -46,16 +45,20 @@ def compile_c_files(
     config: CompilerConfig | None = None,
     mode: str = "binary",
     extra_objects: list[Path] | None = None,
+    tc_dir: Path | None = None,
+    python_version: str | None = None,
 ) -> Path:
     """compile C source files into a binary or shared library.
 
     mode: "binary" for standalone executable, "module" for .so python extension
+    tc_dir: path to the python-build-standalone installation
+    python_version: minor version (e.g. "3.14") for path/lib resolution
     """
     if config is None:
         config = CompilerConfig()
 
     if mode == "binary":
-        return _compile_binary(sources, output, config, extra_objects)
+        return _compile_binary(sources, output, config, extra_objects, tc_dir, python_version)
     elif mode == "module":
         return _compile_module(sources, output, config, extra_objects)
     else:
@@ -67,34 +70,27 @@ def _compile_binary(
     output: Path,
     config: CompilerConfig,
     extra_objects: list[Path] | None = None,
+    tc_dir: Path | None = None,
+    python_version: str | None = None,
 ) -> Path:
-    """compile a standalone binary.
+    """compile a standalone binary using python-build-standalone.
 
-    uses python-build-standalone if available to produce a self-contained
-    binary bundle (binary + dylib + stdlib). falls back to dynamic linking
-    against the current python otherwise.
+    produces a self-contained binary bundle (binary + dylib + stdlib).
+    falls back to dynamic linking against the current python if tc_dir
+    is not provided.
     """
-    pbs_dir = get_standalone_python_dir()
-
-    if pbs_dir:
-        return _compile_binary_standalone(sources, output, config, pbs_dir, extra_objects)
+    if tc_dir:
+        return _compile_binary_standalone(sources, output, config, tc_dir, python_version, extra_objects)
     else:
         return _compile_binary_dynamic(sources, output, config, extra_objects)
-
-
-def _detect_python_version(pbs_dir: Path) -> str:
-    """detect the python major.minor version from the standalone build."""
-    for d in (pbs_dir / "lib").iterdir():
-        if d.is_dir() and d.name.startswith("python3."):
-            return d.name.replace("python", "")
-    raise RuntimeError("could not detect python version in standalone build")
 
 
 def _compile_binary_standalone(
     sources: list[Path],
     output: Path,
     config: CompilerConfig,
-    pbs_dir: Path,
+    tc_dir: Path,
+    python_version: str | None = None,
     extra_objects: list[Path] | None = None,
 ) -> Path:
     """compile a standalone binary bundle using python-build-standalone.
@@ -103,9 +99,12 @@ def _compile_binary_standalone(
       output           - the executable
       output.lib/      - bundled python dylib + zipped stdlib
     """
-    pyver = _detect_python_version(pbs_dir)
-    include_dir = pbs_dir / "include" / f"python{pyver}"
-    dylib_path = pbs_dir / "lib" / f"libpython{pyver}.dylib"
+    from viper.toolchain import get_python_include, get_python_dylib, get_python_stdlib
+
+    pyver = python_version or _detect_python_version(tc_dir)
+    include_dir = get_python_include(tc_dir, pyver)
+    dylib_path = get_python_dylib(tc_dir, pyver)
+    stdlib_dir = get_python_stdlib(tc_dir, pyver)
 
     if not dylib_path.exists():
         raise RuntimeError(f"python dylib not found: {dylib_path}")
@@ -125,7 +124,7 @@ def _compile_binary_standalone(
         cmd += [str(o) for o in extra_objects]
 
     # link against libpython, with rpath pointing to the bundle dir
-    cmd += [f"-L{pbs_dir / 'lib'}"]
+    cmd += [f"-L{tc_dir / 'lib'}"]
     cmd += [f"-lpython{pyver}"]
     cmd += [f"-Wl,-rpath,@executable_path/{output.name}.lib"]
     cmd += ["-ldl", "-lm"]
@@ -142,9 +141,8 @@ def _compile_binary_standalone(
     shutil.copy2(dylib_path, lib_dir / dylib_path.name)
 
     # create a zipped stdlib for the bundle
-    stdlib_dir = pbs_dir / "lib" / f"python{pyver}"
     stdlib_zip = lib_dir / f"python{pyver.replace('.', '')}.zip"
-    _create_stdlib_zip(stdlib_dir, stdlib_zip)
+    _create_stdlib_zip(stdlib_dir, stdlib_zip, tc_dir=tc_dir)
 
     # copy lib-dynload .so files (the few not built into the dylib)
     dynload_src = stdlib_dir / "lib-dynload"
@@ -157,55 +155,104 @@ def _compile_binary_standalone(
     return output
 
 
-def _create_stdlib_zip(stdlib_dir: Path, output_zip: Path) -> None:
+def _create_stdlib_zip(stdlib_dir: Path, output_zip: Path, tc_dir: Path | None = None) -> None:
     """create a zip archive of the python stdlib with compiled bytecode.
 
-    includes .pyc files alongside .py so zipimport doesn't need to
-    compile source at import time. this is the main startup optimization
-    for the standalone build.
+    uses the toolchain python to compile .pyc files so the bytecode matches
+    the target python version. this is the main startup optimization for
+    the standalone build -- without .pyc, every stdlib import compiles from
+    source at startup.
     """
-    import marshal
-    import struct
-    import importlib.util
-    import time
-
     skip_dirs = {"test", "tests", "idle_test", "tkinter",
                  "turtledemo", "ensurepip", "lib2to3", "lib-dynload",
                  "site-packages"}
 
-    magic = importlib.util.MAGIC_NUMBER
-    flags = b'\x00\x00\x00\x00'
+    # collect all .py files first
+    py_files: list[tuple[Path, str]] = []
+    for root, dirs, files in os.walk(stdlib_dir):
+        rel_root = Path(root).relative_to(stdlib_dir)
+        dirs[:] = [d for d in dirs if d not in skip_dirs
+                   and not d.startswith("config-")
+                   and d != "__pycache__"]
+        for f in files:
+            if f.endswith(".py"):
+                py_files.append((Path(root) / f, str(rel_root / f)))
+
+    # batch-compile .pyc using the toolchain python
+    pyc_data = _batch_compile_stdlib(py_files, tc_dir)
 
     with zipfile.ZipFile(output_zip, "w", zipfile.ZIP_DEFLATED) as zf:
-        for root, dirs, files in os.walk(stdlib_dir):
-            rel_root = Path(root).relative_to(stdlib_dir)
+        for src, arcname in py_files:
+            zf.write(src, arcname)
+            pyc = pyc_data.get(arcname)
+            if pyc:
+                zf.writestr(arcname + "c", pyc)
 
-            dirs[:] = [d for d in dirs if d not in skip_dirs
-                       and not d.startswith("config-")
-                       and d != "__pycache__"]
 
-            for f in files:
-                if not f.endswith(".py"):
-                    continue
-                src = Path(root) / f
-                arcname = str(rel_root / f)
+def _batch_compile_stdlib(
+    py_files: list[tuple[Path, str]],
+    tc_dir: Path | None,
+) -> dict[str, bytes]:
+    """compile stdlib .py files to .pyc using the toolchain python.
 
-                # write .py source
-                zf.write(src, arcname)
+    runs a single subprocess that compiles all files and writes .pyc data
+    to a temp directory. returns a dict of arcname -> pyc bytes.
+    """
+    import base64
+    import tempfile
 
-                # compile to .pyc and write alongside
-                try:
-                    source = src.read_bytes()
-                    code = compile(source, arcname, "exec", dont_inherit=True, optimize=0)
-                    data = marshal.dumps(code)
-                    # .pyc header: magic(4) + flags(4) + mtime(4) + size(4)
-                    mtime = int(src.stat().st_mtime)
-                    size = len(source)
-                    header = magic + flags + struct.pack("<II", mtime, size)
-                    pyc_arcname = arcname + "c"  # foo.py -> foo.pyc
-                    zf.writestr(pyc_arcname, header + data)
-                except Exception:
-                    pass
+    if tc_dir is None:
+        return {}
+
+    from viper.toolchain import get_python_bin
+    tc_python = get_python_bin(tc_dir)
+
+    # helper script: reads (arcname, filepath) pairs from stdin,
+    # compiles each, writes base64-encoded .pyc to stdout
+    script = r"""
+import sys, marshal, struct, importlib.util, base64
+magic = importlib.util.MAGIC_NUMBER
+flags = b'\x00\x00\x00\x00'
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    arcname, filepath = line.split('\t', 1)
+    try:
+        with open(filepath, 'rb') as f:
+            source = f.read()
+        code = compile(source, arcname, 'exec', dont_inherit=True, optimize=0)
+        data = marshal.dumps(code)
+        mtime = int(__import__('os').path.getmtime(filepath))
+        size = len(source)
+        header = magic + flags + struct.pack('<II', mtime, size)
+        encoded = base64.b64encode(header + data).decode()
+        sys.stdout.write(f'OK\t{arcname}\t{encoded}\n')
+    except Exception as e:
+        sys.stdout.write(f'ERR\t{arcname}\t{e}\n')
+    sys.stdout.flush()
+"""
+
+    proc = subprocess.Popen(
+        [str(tc_python), "-c", script],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+
+    # feed all files
+    input_lines = []
+    for src, arcname in py_files:
+        input_lines.append(f"{arcname}\t{src}")
+    stdout, _ = proc.communicate("\n".join(input_lines) + "\n")
+
+    result: dict[str, bytes] = {}
+    for line in stdout.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) == 3 and parts[0] == "OK":
+            result[parts[1]] = base64.b64decode(parts[2])
+
+    return result
 
 
 def _compile_binary_dynamic(

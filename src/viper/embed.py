@@ -1,6 +1,14 @@
 from __future__ import annotations
+from dataclasses import dataclass
 from pathlib import Path
 from viper.freezer import FrozenModule
+
+
+@dataclass
+class GeneratedSources:
+    """files produced by the code generator that need to be compiled."""
+    c_file: Path
+    extra_objects: list[Path]
 
 
 def generate_frozen_c(
@@ -12,18 +20,34 @@ def generate_frozen_c(
     standalone_bundle: str | None = None,
     python_version: str | None = None,
     has_native_packages: bool = False,
-) -> Path:
-    """generate a C file that embeds all frozen modules using PyImport_FrozenModules.
+) -> GeneratedSources:
+    """generate C + binary blob that embeds all frozen modules.
+
+    bytecode is written as a raw binary blob (output.with_suffix('.bin'))
+    and embedded via an assembly .S file using .incbin. the C file is small
+    and contains only the frozen module table, helpers, and main().
 
     uses cpython's native frozen module infrastructure so imports are resolved
     entirely in C with no python-level finder overhead.
-
-    standalone_bundle: the name of the .lib directory next to the binary
-        (e.g. "flash.lib"). the generated C configures python to find its
-        stdlib and native packages from this bundle at runtime.
-    has_native_packages: if true, adds the bundle's site-packages dir to
-        sys.path so C extensions can be found.
     """
+    out_dir = output.parent
+    blob_path = out_dir / "viper_blob.bin"
+    asm_path = out_dir / "viper_blob.S"
+
+    # write bytecode blob and compute offsets
+    offsets: list[tuple[str, int, int, bool]] = []  # (name, offset, size, is_pkg)
+    with open(blob_path, "wb") as f:
+        for mod in modules:
+            offset = f.tell()
+            f.write(mod.bytecode)
+            offsets.append((mod.name, offset, len(mod.bytecode), mod.is_package))
+
+    blob_size = blob_path.stat().st_size
+
+    # write assembly file that includes the blob
+    _write_asm(asm_path, blob_path)
+
+    # write C file
     lines: list[str] = []
     lines.append('#include <Python.h>')
     lines.append('#include <limits.h>')
@@ -32,31 +56,20 @@ def generate_frozen_c(
     lines.append('#include <mach-o/dyld.h>')
     lines.append('#endif')
     lines.append('')
+    lines.append('/* bytecode blob embedded via assembly (.incbin) */')
+    lines.append('extern const unsigned char viper_blob[];')
+    lines.append('')
 
-    # emit bytecode arrays
-    for mod in modules:
-        c_name = _c_ident(mod.name)
-        data = mod.bytecode
-        lines.append(f'static const unsigned char frozen_{c_name}[] = {{')
-        for i in range(0, len(data), 16):
-            chunk = data[i:i+16]
-            hex_vals = ", ".join(f"0x{b:02x}" for b in chunk)
-            lines.append(f'    {hex_vals},')
-        lines.append('};')
-        lines.append('')
-
-    # emit the frozen module table (struct _frozen array)
+    # frozen module table pointing into the blob
     lines.append('static const struct _frozen viper_frozen_modules[] = {')
-    for mod in modules:
-        c_name = _c_ident(mod.name)
-        pkg = 1 if mod.is_package else 0
-        lines.append(f'    {{"{mod.name}", frozen_{c_name}, '
-                     f'(int)sizeof(frozen_{c_name}), {pkg}}},')
+    for name, offset, size, is_pkg in offsets:
+        pkg = 1 if is_pkg else 0
+        lines.append(f'    {{"{name}", viper_blob + {offset}, {size}, {pkg}}},')
     lines.append('    {NULL, NULL, 0, 0}')
     lines.append('};')
     lines.append('')
 
-    # minimal startup python code (metadata injection + sys.frozen)
+    # startup python code
     startup_py = _generate_startup_python(
         package_name=package_name,
         package_version=package_version,
@@ -68,14 +81,12 @@ def generate_frozen_c(
 
     _emit_exe_dir_helper(lines)
 
-    # emit main
+    # main
     mod_part, callable_part = _parse_entry_point(entry_point)
 
     lines.append('int main(int argc, char **argv) {')
-    lines.append('    /* register frozen modules before interpreter init */')
     lines.append('    PyImport_FrozenModules = viper_frozen_modules;')
     lines.append('')
-    lines.append('    /* resolve path to this executable */')
     lines.append('    char exe_dir[PATH_MAX];')
     lines.append('    int have_exe_dir = (get_exe_dir(exe_dir, sizeof(exe_dir)) == 0);')
     lines.append('')
@@ -101,9 +112,7 @@ def generate_frozen_c(
     lines.append('    PyConfig_Clear(&config);')
     lines.append('')
 
-    # add bundle site-packages to sys.path for C extension loading
     if has_native_packages and standalone_bundle:
-        lines.append('    /* add bundle site-packages to sys.path for C extensions */')
         lines.append('    if (have_exe_dir) {')
         lines.append('        char sp_path[PATH_MAX];')
         lines.append(f'        snprintf(sp_path, sizeof(sp_path), "%s/{standalone_bundle}/site-packages", exe_dir);')
@@ -112,16 +121,12 @@ def generate_frozen_c(
         lines.append('    }')
         lines.append('')
 
-    # run startup code (sys.frozen + metadata)
     if startup_py:
-        lines.append('    /* set sys.frozen and inject package metadata */')
         lines.append('    if (PyRun_SimpleString(viper_startup_code) != 0) {')
         lines.append('        fprintf(stderr, "viper: startup code failed\\n");')
         lines.append('    }')
         lines.append('')
 
-    # call entry point
-    lines.append(f'    /* run entry point: {entry_point} */')
     lines.append(f'    PyObject *entry_mod = PyImport_ImportModule("{mod_part}");')
     lines.append('    if (entry_mod == NULL) {')
     lines.append('        PyErr_Print();')
@@ -171,14 +176,36 @@ def generate_frozen_c(
     lines.append('    return 1;')
     lines.append('}')
 
-    c_source = "\n".join(lines) + "\n"
-    output.write_text(c_source)
-    return output
+    output.write_text("\n".join(lines) + "\n")
+
+    return GeneratedSources(
+        c_file=output,
+        extra_objects=[asm_path],
+    )
+
+
+def _write_asm(asm_path: Path, blob_path: Path) -> None:
+    """write assembly file that embeds the bytecode blob via .incbin."""
+    # use absolute path so the assembler finds the blob regardless of cwd
+    abs_blob = str(blob_path.resolve())
+    lines = [
+        '#ifdef __APPLE__',
+        '.section __DATA,__const',
+        '#else',
+        '.section .rodata',
+        '#endif',
+        '.globl _viper_blob',
+        '.globl viper_blob',
+        '.p2align 4',
+        '_viper_blob:',
+        'viper_blob:',
+        f'.incbin "{abs_blob}"',
+    ]
+    asm_path.write_text("\n".join(lines) + "\n")
 
 
 def _emit_exe_dir_helper(lines: list[str]) -> None:
     """emit a C function that resolves the directory containing the executable."""
-    lines.append('/* resolve the directory containing this executable at runtime */')
     lines.append('static int get_exe_dir(char *buf, size_t bufsize) {')
     lines.append('#ifdef __APPLE__')
     lines.append('    uint32_t size = (uint32_t)bufsize;')
@@ -211,39 +238,35 @@ def _emit_standalone_path_config(
     has_native_packages: bool,
 ) -> None:
     """emit C code that configures python's module search paths for standalone mode."""
-    lines.append('    /* configure standalone python paths */')
     lines.append('    if (have_exe_dir) {')
-    lines.append(f'        char home_path[PATH_MAX];')
+    lines.append('        char home_path[PATH_MAX];')
     lines.append(f'        snprintf(home_path, sizeof(home_path), "%s/{bundle_name}", exe_dir);')
     lines.append('')
-    lines.append(f'        wchar_t whome[PATH_MAX];')
-    lines.append(f'        mbstowcs(whome, home_path, PATH_MAX);')
-    lines.append(f'        status = PyConfig_SetString(&config, &config.home, whome);')
-    lines.append(f'        if (PyStatus_Exception(status)) goto fail;')
+    lines.append('        wchar_t whome[PATH_MAX];')
+    lines.append('        mbstowcs(whome, home_path, PATH_MAX);')
+    lines.append('        status = PyConfig_SetString(&config, &config.home, whome);')
+    lines.append('        if (PyStatus_Exception(status)) goto fail;')
     lines.append('')
-    lines.append(f'        config.module_search_paths_set = 1;')
-    lines.append(f'        char path_buf[PATH_MAX];')
-    lines.append(f'        wchar_t wpath[PATH_MAX];')
+    lines.append('        config.module_search_paths_set = 1;')
+    lines.append('        char path_buf[PATH_MAX];')
+    lines.append('        wchar_t wpath[PATH_MAX];')
     lines.append('')
-    # zipped stdlib
     lines.append(f'        snprintf(path_buf, sizeof(path_buf), "%s/{bundle_name}/python{pyver_nodot}.zip", exe_dir);')
-    lines.append(f'        mbstowcs(wpath, path_buf, PATH_MAX);')
-    lines.append(f'        status = PyWideStringList_Append(&config.module_search_paths, wpath);')
-    lines.append(f'        if (PyStatus_Exception(status)) goto fail;')
+    lines.append('        mbstowcs(wpath, path_buf, PATH_MAX);')
+    lines.append('        status = PyWideStringList_Append(&config.module_search_paths, wpath);')
+    lines.append('        if (PyStatus_Exception(status)) goto fail;')
     lines.append('')
-    # lib-dynload (stdlib C extensions)
     lines.append(f'        snprintf(path_buf, sizeof(path_buf), "%s/{bundle_name}/python{pyver}/lib-dynload", exe_dir);')
-    lines.append(f'        mbstowcs(wpath, path_buf, PATH_MAX);')
-    lines.append(f'        status = PyWideStringList_Append(&config.module_search_paths, wpath);')
-    lines.append(f'        if (PyStatus_Exception(status)) goto fail;')
+    lines.append('        mbstowcs(wpath, path_buf, PATH_MAX);')
+    lines.append('        status = PyWideStringList_Append(&config.module_search_paths, wpath);')
+    lines.append('        if (PyStatus_Exception(status)) goto fail;')
 
     if has_native_packages:
         lines.append('')
-        # third-party C extensions
         lines.append(f'        snprintf(path_buf, sizeof(path_buf), "%s/{bundle_name}/site-packages", exe_dir);')
-        lines.append(f'        mbstowcs(wpath, path_buf, PATH_MAX);')
-        lines.append(f'        status = PyWideStringList_Append(&config.module_search_paths, wpath);')
-        lines.append(f'        if (PyStatus_Exception(status)) goto fail;')
+        lines.append('        mbstowcs(wpath, path_buf, PATH_MAX);')
+        lines.append('        status = PyWideStringList_Append(&config.module_search_paths, wpath);')
+        lines.append('        if (PyStatus_Exception(status)) goto fail;')
 
     lines.append('    }')
     lines.append('')

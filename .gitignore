@@ -7,10 +7,10 @@ __pycache__/
 *.o
 
 # build artifacts
-flash
-flash.lib/
-hello
-hello.lib/
+/flash
+/flash.lib/
+/hello
+/hello.lib/
 *.egg-info/
 dist/
 build/
