@@ -3,6 +3,6 @@ revision = 3
 requires-python = ">=3.12"
 
 [[package]]
-name = "viper-compiler"
-version = "0.1.0"
+name = "viperc"
+version = "0.2.0"
 source = { editable = "." }

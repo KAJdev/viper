@@ -46,7 +46,7 @@ def compile_c_files(
 ) -> Path:
     """compile C source files into a binary or shared library.
 
-    mode: "binary" for standalone executable, "module" for .so python extension
+    mode: "binary" for standalone executable, "module" for .so extension
     tc_dir: path to the python-build-standalone installation
     python_version: minor version (e.g. "3.14") for path/lib resolution
     """
@@ -56,7 +56,7 @@ def compile_c_files(
     if mode == "binary":
         return _compile_binary(sources, output, config, extra_objects, tc_dir, python_version)
     elif mode == "module":
-        return _compile_module(sources, output, config, extra_objects)
+        return _compile_module(sources, output, config, extra_objects, tc_dir, python_version)
     else:
         raise ValueError(f"unknown mode: {mode}")
 
@@ -291,16 +291,26 @@ def _compile_module(
     output: Path,
     config: CompilerConfig,
     extra_objects: list[Path] | None = None,
+    tc_dir: Path | None = None,
+    python_version: str | None = None,
 ) -> Path:
     """compile a python C extension module (.so)."""
     cmd = [config.cc, config.opt_level]
     cmd += ["-shared", "-fPIC"]
-    cmd += [f"-I{config.python_include}"]
+
+    if tc_dir and python_version:
+        from viper.toolchain import get_python_include
+        cmd += [f"-I{get_python_include(tc_dir, python_version)}"]
+    else:
+        cmd += [f"-I{config.python_include}"]
 
     cmd += [str(s) for s in sources]
 
     if extra_objects:
         cmd += [str(o) for o in extra_objects]
+
+    if sys.platform == "darwin":
+        cmd += ["-undefined", "dynamic_lookup"]
 
     cmd += ["-o", str(output)]
 

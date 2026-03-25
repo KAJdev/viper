@@ -1,5 +1,6 @@
 from __future__ import annotations
 import argparse
+import sysconfig
 import sys
 import tempfile
 import tomllib
@@ -38,15 +39,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def cmd_build(args: argparse.Namespace) -> int:
-    from viper.toolchain import (
-        ensure_toolchain, get_python_bin, DEFAULT_PYTHON,
-    )
-    from viper.resolver import install_deps
-    from viper.freezer import (
-        scan_package, scan_all_dependencies, set_cross_python, NativePackage,
-    )
-    from viper.embed import generate_frozen_c
-    from viper.linker import compile_c_files, CompilerConfig, bundle_native_packages
+    from viper.toolchain import ensure_toolchain, get_python_bin, DEFAULT_PYTHON
+    from viper.freezer import set_cross_python
 
     pkg_path = args.path.resolve()
     if not pkg_path.exists():
@@ -57,7 +51,6 @@ def cmd_build(args: argparse.Namespace) -> int:
     pyproject = _load_pyproject(pkg_path)
     python_version = args.python or DEFAULT_PYTHON
 
-    # detect entry point
     entry_point = args.entry_point or _get_entry_point(pyproject, pkg_path)
     if entry_point is None:
         print("error: could not detect entry point. use --entry-point module:callable",
@@ -68,16 +61,13 @@ def cmd_build(args: argparse.Namespace) -> int:
         print(f"entry point: {entry_point}")
         print(f"target python: {python_version}")
 
-    # ensure toolchain is available for the requested python version
     tc_dir = ensure_toolchain(python_version=python_version, verbose=verbose)
     tc_python = get_python_bin(tc_dir)
-
-    # cross-compile bytecode using the toolchain python
     set_cross_python(tc_python)
 
     try:
-        return _do_build(args, pkg_path, pyproject, python_version,
-                         tc_dir, tc_python, verbose)
+        return _do_build(args, pkg_path, pyproject, entry_point,
+                         python_version, tc_dir, tc_python, verbose)
     finally:
         set_cross_python(None)
 
@@ -86,6 +76,7 @@ def _do_build(
     args: argparse.Namespace,
     pkg_path: Path,
     pyproject: dict | None,
+    entry_point: str,
     python_version: str,
     tc_dir: Path,
     tc_python: Path,
@@ -93,23 +84,20 @@ def _do_build(
 ) -> int:
     from viper.resolver import install_deps
     from viper.freezer import scan_package, scan_all_dependencies, NativePackage
-    from viper.embed import generate_frozen_c
+    from viper.embed import generate_all
     from viper.linker import compile_c_files, CompilerConfig, bundle_native_packages
 
-    # normalize to minor version for paths/flags
     pyver = _to_minor(python_version)
 
-    # install target's deps into a temp directory
     with tempfile.TemporaryDirectory(prefix="viper_deps_") as deps_dir:
         if not args.no_deps and pyproject:
             raw_deps = pyproject.get("project", {}).get("dependencies", [])
             install_deps(raw_deps, Path(deps_dir) / "site-packages",
                          tc_python=tc_python, verbose=verbose)
 
-        # scan and freeze
         if verbose:
             print(f"scanning package: {pkg_path}")
-        scan = scan_package(pkg_path, entry_point=args.entry_point or _get_entry_point(pyproject, pkg_path))
+        scan = scan_package(pkg_path, entry_point)
         if verbose:
             print(f"  found {len(scan.modules)} modules")
 
@@ -129,7 +117,6 @@ def _do_build(
         if verbose:
             print(f"total modules to embed: {len(all_modules)}")
 
-        # determine output path
         pkg_name = _get_package_name(pyproject, pkg_path)
         if args.output:
             output = args.output.resolve()
@@ -138,35 +125,49 @@ def _do_build(
             output = Path.cwd() / (script_name or pkg_name)
 
         bundle_name = f"{output.name}.lib"
+        top_level = _get_top_level_name(pyproject, pkg_path)
 
-        # generate C and compile
         with tempfile.TemporaryDirectory(prefix="viper_cc_") as cc_dir:
-            c_file = Path(cc_dir) / "viper_embedded.c"
+            cc_path = Path(cc_dir)
 
             if verbose:
                 print(f"generating C source ({len(all_modules)} modules)...")
 
-            gen = generate_frozen_c(
-                all_modules, entry_point=args.entry_point or _get_entry_point(pyproject, pkg_path),
-                output=c_file,
+            gen = generate_all(
+                all_modules,
+                entry_point=entry_point,
+                out_dir=cc_path,
                 package_name=_get_dist_name(pyproject) or pkg_name,
                 package_version=_get_version(pyproject),
                 standalone_bundle=bundle_name,
                 python_version=pyver,
                 has_native_packages=bool(native_packages),
+                top_level_name=top_level,
             )
 
             if verbose:
-                c_size = gen.c_file.stat().st_size
-                blob_size = (gen.c_file.parent / "viper_blob.bin").stat().st_size
-                print(f"  C source: {c_size:,} bytes, bytecode blob: {blob_size:,} bytes")
+                blob_size = (cc_path / "viper_blob.bin").stat().st_size
+                print(f"  bytecode blob: {blob_size:,} bytes")
                 print("compiling...")
 
+            # compile standalone binary
             compile_c_files(
-                sources=[gen.c_file] + gen.extra_objects,
+                sources=[gen.bin_c] + gen.bin_extra,
                 output=output,
                 config=CompilerConfig(),
                 mode="binary",
+                tc_dir=tc_dir,
+                python_version=pyver,
+            )
+
+            # compile importable .so module
+            ext_suffix = _get_ext_suffix(tc_python)
+            so_output = output.parent / f"{top_level}{ext_suffix}"
+            compile_c_files(
+                sources=[gen.mod_c] + gen.mod_extra,
+                output=so_output,
+                config=CompilerConfig(),
+                mode="module",
                 tc_dir=tc_dir,
                 python_version=pyver,
             )
@@ -177,6 +178,7 @@ def _do_build(
             bundle_native_packages(native_packages, sp_dir, verbose=verbose)
 
     size = output.stat().st_size
+    so_size = so_output.stat().st_size
     lib_dir = output.parent / bundle_name
     if lib_dir.exists():
         import shutil
@@ -184,11 +186,24 @@ def _do_build(
         print(f"built: {output} ({size:,} bytes, bundle {lib_size:,} bytes)")
     else:
         print(f"built: {output} ({size:,} bytes)")
+    print(f"built: {so_output} ({so_size:,} bytes)")
     return 0
 
 
+def _get_ext_suffix(tc_python: Path) -> str:
+    """get the extension module suffix from the toolchain python."""
+    import subprocess
+    result = subprocess.run(
+        [str(tc_python), "-c", "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))"],
+        capture_output=True, text=True,
+    )
+    suffix = result.stdout.strip()
+    if suffix:
+        return suffix
+    return ".so"
+
+
 def _to_minor(version: str) -> str:
-    """normalize to major.minor (e.g. "3.14.3" -> "3.14")."""
     parts = version.split(".")
     if len(parts) >= 2:
         return f"{parts[0]}.{parts[1]}"
@@ -223,6 +238,16 @@ def _get_package_name(data: dict | None, pkg_path: Path) -> str:
     if pkg_path.is_file():
         return pkg_path.stem
     return pkg_path.name
+
+
+def _get_top_level_name(data: dict | None, pkg_path: Path) -> str:
+    """get the importable top-level package name."""
+    src = pkg_path / "src"
+    search = src if src.is_dir() else pkg_path
+    for d in search.iterdir():
+        if d.is_dir() and (d / "__init__.py").exists():
+            return d.name
+    return _get_package_name(data, pkg_path)
 
 
 def _get_dist_name(data: dict | None) -> str | None:

@@ -1,32 +1,35 @@
 # viper
 
-compile python packages into standalone native binaries. no python installation required to run them.
+compile python packages into standalone binaries and importable native extensions.
 
 ```
 $ uvx viperc build ./myapp
 built: ./myapp (17,307,272 bytes, bundle 85,344,541 bytes)
+built: ./myapp_pkg.cpython-314-darwin.so (17,308,416 bytes)
+```
 
-$ ./myapp --version
-MyApp v1.0.0
+one command, two outputs:
 
-$ time ./myapp --version
-real 0m0.49s
+```bash
+./myapp --version          # standalone binary, no python needed
+python -c "import myapp"   # importable .so, same frozen bytecode
 ```
 
 ## how it works
 
-viper freezes your python source as bytecode into a native executable using cpython's `PyImport_FrozenModules`. the binary bundles a cpython dylib and zipped stdlib so it runs anywhere with zero dependencies.
+viper freezes your python source as bytecode into a native executable using cpython's `PyImport_FrozenModules`. the binary bundles a cpython dylib and zipped stdlib so it runs anywhere with zero dependencies. the `.so` module uses the same bytecode blob but loads as a normal python extension.
 
 ```
-myapp              17MB executable (~1300 frozen modules)
+myapp                               17MB executable (~1300 frozen modules)
+myapp_pkg.cpython-314-darwin.so     17MB importable extension module
 myapp.lib/
 ├── libpython3.14.dylib
-├── python314.zip        (stdlib with pre-compiled .pyc)
+├── python314.zip                   (stdlib with pre-compiled .pyc)
 ├── python3.14/lib-dynload/
-└── site-packages/       (C extensions, data files, dist-info)
+└── site-packages/                  (C extensions, data files, dist-info)
 ```
 
-pure python deps get frozen as bytecode directly in the binary. packages with C extensions (`.so`) or data files get bundled to `site-packages/`.
+pure python deps get frozen as bytecode directly in the binary. packages with C extensions or data files get bundled to `site-packages/`.
 
 ## install
 
@@ -63,14 +66,11 @@ myapp = "mypackage.cli:main"
 
 ## target python version
 
-the `--python` flag controls which cpython version the binary embeds. viper itself can run on any python 3.12+, but the binary targets whatever you specify:
+the `--python` flag controls which cpython version gets embedded. viper itself runs on any python 3.12+, but the output targets whatever you specify:
 
-```
-# viper runs on 3.13, binary embeds 3.12
-$ python3.13 -m viper build ./app --python 3.12
-
-# same thing via uvx
-$ uvx viper build ./app --python 3.14
+```bash
+uvx viperc build ./app --python 3.12   # binary embeds cpython 3.12
+uvx viperc build ./app --python 3.14   # binary embeds cpython 3.14
 ```
 
 bytecode is cross-compiled and deps are installed for the target version automatically.
