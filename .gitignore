@@ -1,20 +1,8 @@
-.python-standalone/
 .venv/
-.flash/
 __pycache__/
 *.pyc
 *.so
 *.o
-
-# build artifacts
-/flash
-/flash.lib/
-/hello
-/hello.lib/
 *.egg-info/
 dist/
 build/
-
-# test artifacts
-runpod_test
-import_test

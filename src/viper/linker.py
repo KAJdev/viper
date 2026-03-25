@@ -26,10 +26,6 @@ class CompilerConfig:
         return f"python{self.python_ldversion}"
 
 
-def get_runtime_dir() -> Path:
-    """path to the viper C runtime sources"""
-    return Path(__file__).parent.parent.parent / "runtime"
-
 
 def _detect_python_version(tc_dir: Path) -> str:
     """detect the python major.minor version from a toolchain directory."""
@@ -116,7 +112,6 @@ def _compile_binary_standalone(
     # compile, linking against the standalone dylib
     cmd = [config.cc, config.opt_level]
     cmd += [f"-I{include_dir}"]
-    cmd += [f"-I{get_runtime_dir()}"]
 
     cmd += [str(s) for s in sources]
 
@@ -264,7 +259,6 @@ def _compile_binary_dynamic(
     """compile a binary dynamically linked against the current python (fallback)."""
     cmd = [config.cc, config.opt_level]
     cmd += [f"-I{config.python_include}"]
-    cmd += [f"-I{get_runtime_dir()}"]
 
     cmd += [str(s) for s in sources]
 
@@ -302,7 +296,6 @@ def _compile_module(
     cmd = [config.cc, config.opt_level]
     cmd += ["-shared", "-fPIC"]
     cmd += [f"-I{config.python_include}"]
-    cmd += [f"-I{get_runtime_dir()}"]
 
     cmd += [str(s) for s in sources]
 
