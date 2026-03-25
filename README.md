@@ -3,7 +3,7 @@
 compile python packages into standalone native binaries. no python installation required to run them.
 
 ```
-$ uvx viper build ./myapp
+$ uvx viperc build ./myapp
 built: ./myapp (17,307,272 bytes, bundle 85,344,541 bytes)
 
 $ ./myapp --version
@@ -32,10 +32,10 @@ pure python deps get frozen as bytecode directly in the binary. packages with C 
 
 ```
 # run directly
-uvx viper build ./mypackage
+uvx viperc build ./mypackage
 
 # or install
-uv tool install viper-compiler
+uv tool install viperc
 ```
 
 requires a C compiler (`cc`). python-build-standalone is downloaded automatically on first build.
@@ -43,7 +43,7 @@ requires a C compiler (`cc`). python-build-standalone is downloaded automaticall
 ## usage
 
 ```
-viper build <path> [options]
+viperc build <path> [options]
 ```
 
 | flag | description |

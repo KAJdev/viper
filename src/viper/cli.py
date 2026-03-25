@@ -8,7 +8,7 @@ from pathlib import Path
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="viper",
+        prog="viperc",
         description="compile python packages to standalone binaries",
     )
     sub = parser.add_subparsers(dest="command")

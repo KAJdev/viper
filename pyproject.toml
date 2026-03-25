@@ -3,13 +3,13 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "viper-compiler"
-version = "0.1.0"
+name = "viperc"
+version = "0.2.0"
 description = "compile python packages to standalone binaries"
 requires-python = ">=3.12"
 
 [project.scripts]
-viper = "viper.cli:main"
+viperc = "viper.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/viper"]
